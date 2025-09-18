@@ -1,0 +1,11 @@
+﻿aiohttp
+feedparser
+pandas==2.2.2
+numpy==1.26.4
+python-telegram-bot[job-queue]==21.4
+matplotlib==3.9.0
+python-dotenv==1.0.1
+pytz==2024.1
+ujson==5.10.0
+requests==2.32.3
+yfinance==0.2.43

@@ -1,238 +1,341 @@
 # trade_binance.py
-# واجهة REST مبسطة لـ Binance Spot + USDT-M Futures مع دوال مساعدة للفلاتر والأرصدة والرافعة
-
+from __future__ import annotations
+import os
 import time
 import hmac
-import hashlib
-import requests
 import math
-from urllib.parse import urlencode
+import hashlib
+import logging
+from typing import Any, Dict, Optional, List, Tuple
+
+import requests
+import pandas as pd
+from zoneinfo import ZoneInfo
 
 from config import CFG
 
-# إعدادات عامة من config مع قيم افتراضية
-BIN = CFG.get("BINANCE", {})
-API_KEY     = BIN.get("api_key", "")
-API_SECRET  = BIN.get("api_secret", "")
-TESTNET     = int(BIN.get("testnet", BIN.get("use_testnet", 0)))  # 0=Prod, 1=Testnet
-RECV_WINDOW = int(BIN.get("recv_window", 5000))
+log = logging.getLogger("binance")
+log.setLevel(logging.INFO)
 
-# نهايات Binance
-SPOT_BASE_PROD    = "https://api.binance.com"
-SPOT_BASE_TESTNET = "https://testnet.binance.vision"
-FAPI_BASE_PROD    = "https://fapi.binance.com"
-FAPI_BASE_TESTNET = "https://testnet.binancefuture.com"
+# =========================
+# Utilities
+# =========================
+def _to_bool(v: Any, default: bool = False) -> bool:
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    return s in ("1", "true", "yes", "y", "on")
 
-def _now_ms():
-    return int(time.time() * 1000)
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
 
+# =========================
+# REST Client
+# =========================
 class BinanceREST:
-    def __init__(self):
-        self.api_key    = API_KEY
-        self.api_secret = API_SECRET.encode("utf-8") if API_SECRET else b""
-        self.spot_base  = SPOT_BASE_TESTNET if TESTNET else SPOT_BASE_PROD
-        self.fapi_base  = FAPI_BASE_TESTNET if TESTNET else FAPI_BASE_PROD
-        self.time_offset_spot  = 0
-        self.time_offset_fut   = 0
+    """
+    سبوت فقط (ليس Futures). يدعم:
+      - klines() [سبوت]
+      - order_market_buy_quote()
+      - order_market_sell_qty()
+      - ticker_24h_all()
+      - get_free() / account_info()
+      - exchange_info() + دوال التقريب للفلاتر
+      - sync_time()
+    """
 
-        # جلسة HTTP واحدة
-        self.s = requests.Session()
-        if self.api_key:
-            self.s.headers.update({"X-MBX-APIKEY": self.api_key})
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        api_secret: Optional[str] = None,
+        testnet: Optional[bool] = None,
+        recv_window: int = 5000,
+        timeout: int = 15,
+    ):
+        self.api_key = api_key or os.getenv("BINANCE_API_KEY") or CFG.get("BINANCE_API_KEY", "")
+        self.api_secret = api_secret or os.getenv("BINANCE_API_SECRET") or CFG.get("BINANCE_API_SECRET", "")
+        self.testnet = _to_bool(testnet if testnet is not None else (os.getenv("BINANCE_TESTNET") or CFG.get("BINANCE_TESTNET", "0")))
+        self.recv_window = int(recv_window)
+        self.timeout = int(timeout)
 
-    # ------------------------ أدوات داخلية ------------------------
+        self._base = "https://testnet.binance.vision" if self.testnet else "https://api.binance.com"
+        self._time_offset_ms = 0  # serverTime - local_ms
+        self._exinfo_cache: Dict[str, Any] = {}
+        self._tz = ZoneInfo(str(CFG.get("TZ", "Asia/Riyadh")))
 
-    def sync_time(self):
-        """تزامن الوقت مع Binance (Spot + Futures)."""
-        try:
-            t_spot = self._http("GET", f"{self.spot_base}/api/v3/time")
-            srv = int(t_spot.get("serverTime"))
-            self.time_offset_spot = srv - _now_ms()
-        except Exception:
-            pass
-        try:
-            t_fut = self._http("GET", f"{self.fapi_base}/fapi/v1/time")
-            srv = int(t_fut.get("serverTime"))
-            self.time_offset_fut = srv - _now_ms()
-        except Exception:
-            pass
-
-    def _ts_spot(self):
-        return _now_ms() + self.time_offset_spot
-
-    def _ts_fut(self):
-        return _now_ms() + self.time_offset_fut
-
-    def _http(self, method: str, url: str, params=None, headers=None, timeout=15):
-        params = params or {}
-        headers = headers or {}
-        r = self.s.request(method=method, url=url, params=params if method=="GET" else None,
-                           data=params if method!="GET" else None, headers=headers, timeout=timeout)
-        r.raise_for_status()
-        if r.text and r.headers.get("Content-Type","").startswith("application/json"):
-            return r.json()
-        # بعض ردود testnet ترجع نصاً عند بعض الأخطاء، نعطيها كما هي
-        try:
-            return r.json()
-        except Exception:
-            return {"raw": r.text, "status": r.status_code}
-
-    def _sign(self, query: dict) -> str:
-        q = urlencode(query, doseq=True)
-        sig = hmac.new(self.api_secret, q.encode("utf-8"), hashlib.sha256).hexdigest()
-        return f"{q}&signature={sig}"
-
-    # ------------------------ Spot REST ------------------------
-
-    def _public(self, method: str, path: str, params=None):
-        url = f"{self.spot_base}{path}"
-        return self._http(method, url, params=params or {})
-
-    def _signed(self, method: str, path: str, params=None):
         if not self.api_key or not self.api_secret:
-            raise RuntimeError("ضع BINANCE_API_KEY و BINANCE_API_SECRET في .env/CFG")
-        url = f"{self.spot_base}{path}"
-        q = params.copy() if params else {}
-        q.setdefault("recvWindow", RECV_WINDOW)
-        q["timestamp"] = self._ts_spot()
-        query = self._sign(q)
-        headers = {"X-MBX-APIKEY": self.api_key}
-        if method == "GET":
-            return self._http("GET", url, params=query, headers=headers)
-        else:
-            return self._http(method, url, params=query, headers=headers)
+            log.warning("BINANCE_API_KEY / BINANCE_API_SECRET not set. Public endpoints only.")
 
-    def order_market_buy_quote(self, symbol: str, quote_qty: float):
-        """شراء Spot بقيمة Quote (USDT) — يستخدم quoteOrderQty."""
+    # ------------- low-level http -------------
+    def _headers(self) -> Dict[str, str]:
+        return {"X-MBX-APIKEY": self.api_key} if self.api_key else {}
+
+    def _sign(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        if "timestamp" not in params:
+            params["timestamp"] = int(time.time() * 1000) + self._time_offset_ms
+        if "recvWindow" not in params:
+            params["recvWindow"] = self.recv_window
+        q = "&".join([f"{k}={params[k]}" for k in sorted(params.keys())])
+        sig = hmac.new(self.api_secret.encode("utf-8"), q.encode("utf-8"), hashlib.sha256).hexdigest()
+        params["signature"] = sig
+        return params
+
+    def _get(self, path: str, signed: bool = False, params: Optional[Dict[str, Any]] = None) -> Any:
+        url = f"{self._base}{path}"
+        params = dict(params or {})
+        if signed:
+            params = self._sign(params)
+        r = requests.get(url, headers=self._headers(), params=params, timeout=self.timeout)
+        # لو فشل JSON، ارفع استثناء واضح
+        try:
+            js = r.json()
+        except Exception:
+            r.raise_for_status()
+            raise
+        if r.status_code != 200:
+            self._raise_api_error(js)
+        return js
+
+    def _post(self, path: str, signed: bool = False, data: Optional[Dict[str, Any]] = None) -> Any:
+        url = f"{self._base}{path}"
+        data = dict(data or {})
+        if signed:
+            data = self._sign(data)
+        r = requests.post(url, headers=self._headers(), data=data, timeout=self.timeout)
+        try:
+            js = r.json()
+        except Exception:
+            r.raise_for_status()
+            raise
+        if r.status_code != 200:
+            self._raise_api_error(js)
+        return js
+
+    def _delete(self, path: str, signed: bool = False, params: Optional[Dict[str, Any]] = None) -> Any:
+        url = f"{self._base}{path}"
+        params = dict(params or {})
+        if signed:
+            params = self._sign(params)
+        r = requests.delete(url, headers=self._headers(), params=params, timeout=self.timeout)
+        try:
+            js = r.json()
+        except Exception:
+            r.raise_for_status()
+            raise
+        if r.status_code != 200:
+            self._raise_api_error(js)
+        return js
+
+    def _raise_api_error(self, js: Any):
+        """
+        يرفع استثناءً مفيدًا من استجابات باينانس.
+        مثال: {"code": -2010, "msg": "Account has insufficient balance for requested action."}
+        """
+        code = None
+        msg = None
+        if isinstance(js, dict):
+            code = js.get("code")
+            msg = js.get("msg")
+        raise RuntimeError(f"Binance error {code}: {msg}")
+
+    # ------------- time sync -------------
+    def server_time(self) -> int:
+        js = self._get("/api/v3/time")
+        return int(js.get("serverTime", 0))
+
+    def sync_time(self) -> int:
+        """
+        يحدث إزاحة الوقت الداخلية لاستخدامها في التوقيع.
+        """
+        local_ms = int(time.time() * 1000)
+        st = self.server_time()
+        self._time_offset_ms = st - local_ms
+        log.info(f"[sync_time] offset_ms={self._time_offset_ms}")
+        return self._time_offset_ms
+
+    # ------------- exchange info / filters -------------
+    def exchange_info(self, symbol: Optional[str] = None) -> Dict[str, Any]:
+        """
+        يخزّن ExchangeInfo في كاش داخلي. يعيد dict لرمز واحد أو القاموس كله.
+        """
+        if not self._exinfo_cache:
+            js = self._get("/api/v3/exchangeInfo")
+            m = {}
+            for s in js.get("symbols", []):
+                sym = s.get("symbol")
+                m[sym] = s
+            self._exinfo_cache = m
+        if symbol:
+            return self._exinfo_cache.get(symbol.upper(), {})
+        return self._exinfo_cache
+
+    def _filters(self, symbol: str) -> Dict[str, Any]:
+        s = self.exchange_info(symbol)
+        out = {"tickSize": None, "stepSize": None, "minQty": None, "minNotional": None}
+        for f in s.get("filters", []):
+            t = f.get("filterType")
+            if t == "PRICE_FILTER":
+                out["tickSize"] = _safe_float(f.get("tickSize"), 0.0)
+            elif t == "LOT_SIZE":
+                out["stepSize"] = _safe_float(f.get("stepSize"), 0.0)
+                out["minQty"] = _safe_float(f.get("minQty"), 0.0)
+            elif t == "MIN_NOTIONAL":
+                out["minNotional"] = _safe_float(f.get("minNotional"), 0.0)
+            elif t == "NOTIONAL":
+                # بعض الأزواج الحديثة تستخدم NOTIONAL بدلاً من MIN_NOTIONAL
+                out["minNotional"] = _safe_float(f.get("minNotional"), 0.0)
+        return out
+
+    def round_price(self, symbol: str, price: float) -> float:
+        f = self._filters(symbol)
+        tick = f["tickSize"] or 0.0
+        if tick <= 0:
+            return float(f"{price:.8f}")
+        # أرضية ليتوافق مع tickSize
+        k = int(price / tick)
+        return round(k * tick, 8)
+
+    def round_qty(self, symbol: str, qty: float) -> float:
+        f = self._filters(symbol)
+        step = f["stepSize"] or 0.0
+        if step <= 0:
+            return float(f"{qty:.8f}")
+        k = int(qty / step)
+        q = k * step
+        # لا تقل عن minQty
+        if f["minQty"] and q < f["minQty"]:
+            q = f["minQty"]
+        return float(f"{q:.8f}")
+
+    # ------------- public market data -------------
+    def klines(
+        self,
+        symbol: str,
+        interval: str = "1m",
+        limit: int = 1000,
+        start_ms: Optional[int] = None,
+        end_ms: Optional[int] = None,
+    ) -> pd.DataFrame:
+        """
+        /api/v3/klines سبوت.
+        يرجّع DataFrame يحتوي الأعمدة:
+          OpenTime, Open, High, Low, Close, Volume, CloseTime, QuoteAssetVolume, NumberOfTrades, TakerBuyBase, TakerBuyQuote
+        وفهرس زمني (Timezone من CFG['TZ']).
+        """
+        limit = max(1, min(int(limit), 1000))
+        params: Dict[str, Any] = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
+        if start_ms:
+            params["startTime"] = int(start_ms)
+        if end_ms:
+            params["endTime"] = int(end_ms)
+
+        url = f"{self._base}/api/v3/klines"
+        r = requests.get(url, params=params, timeout=self.timeout)
+        r.raise_for_status()
+        data = r.json()
+        if not data:
+            return pd.DataFrame()
+
+        cols_all = [
+            "OpenTime", "Open", "High", "Low", "Close", "Volume",
+            "CloseTime", "QuoteAssetVolume", "NumberOfTrades",
+            "TakerBuyBase", "TakerBuyQuote", "Ignore"
+        ]
+        df = pd.DataFrame(data, columns=cols_all)
+        # تحويل الأنواع
+        for c in ("Open", "High", "Low", "Close", "Volume", "QuoteAssetVolume", "TakerBuyBase", "TakerBuyQuote"):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df["NumberOfTrades"] = pd.to_numeric(df["NumberOfTrades"], errors="coerce").fillna(0).astype(int)
+
+        # فهرس زمني TZ-aware
+        idx = pd.to_datetime(df["OpenTime"], unit="ms", utc=True).tz_convert(self._tz)
+        df.index = idx
+
+        return df[[
+            "Open", "High", "Low", "Close", "Volume",
+            "CloseTime", "QuoteAssetVolume", "NumberOfTrades",
+            "TakerBuyBase", "TakerBuyQuote"
+        ]]
+
+    def ticker_24h_all(self) -> List[Dict[str, Any]]:
+        """
+        كل أزواج 24h — نستخدمها في السكانر.
+        """
+        return self._get("/api/v3/ticker/24hr")
+
+    def ticker_price(self, symbol: str) -> float:
+        js = self._get("/api/v3/ticker/price", params={"symbol": symbol.upper()})
+        return _safe_float(js.get("price"))
+
+    # ------------- account/balances -------------
+    def account_info(self) -> Dict[str, Any]:
+        return self._get("/api/v3/account", signed=True)
+
+    def get_free(self, asset: str) -> float:
+        info = self.account_info()
+        for b in info.get("balances", []):
+            if b.get("asset") == asset.upper():
+                return _safe_float(b.get("free"))
+        return 0.0
+
+    # ------------- trading (MARKET) -------------
+    def order_market_buy_quote(self, symbol: str, quote_qty: float) -> Dict[str, Any]:
+        """
+        شراء Market بمبلغ (quoteOrderQty) — مثال: BTCUSDT بمبلغ 50 USDT.
+        يراعي minNotional تلقائيًا.
+        """
+        symbol = symbol.upper()
+        # تحقق من حد أدنى للنوتيونال
+        f = self._filters(symbol)
+        # احسب سعر تقريبي لتأكيد النوتيونال
+        px = self.ticker_price(symbol)
+        notional_est = quote_qty  # لأن quote = USDT
+        min_notional = f["minNotional"] or 0.0
+        if min_notional and notional_est < min_notional:
+            raise RuntimeError(f"Quote {quote_qty} < minNotional {min_notional} for {symbol}")
+
         params = {
             "symbol": symbol,
             "side": "BUY",
             "type": "MARKET",
-            "quoteOrderQty": f"{float(quote_qty):.2f}",
+            "quoteOrderQty": f"{quote_qty:.2f}",  # باينانس يقبل كسور، لكن 2 decimals كافية لـ USDT
+            "newOrderRespType": "FULL",
         }
-        return self._signed("POST", "/api/v3/order", params=params)
+        try:
+            return self._post("/api/v3/order", signed=True, data=params)
+        except RuntimeError as e:
+            # تمرير رسائل واضحة
+            raise
 
-    def order_market_sell_qty(self, symbol: str, qty: float):
-        """بيع Spot بكمية رمزية."""
+    def order_market_sell_qty(self, symbol: str, qty: float) -> Dict[str, Any]:
+        """
+        بيع Market بكمية (quantity) — يُراعي LOT_SIZE.
+        """
+        symbol = symbol.upper()
+        q = self.round_qty(symbol, float(qty))
         params = {
             "symbol": symbol,
             "side": "SELL",
             "type": "MARKET",
-            "quantity": f"{float(qty):.8f}",
+            "quantity": f"{q:.8f}",
+            "newOrderRespType": "FULL",
         }
-        return self._signed("POST", "/api/v3/order", params=params)
-
-    def balance_free(self, asset: str) -> float:
-        acc = self._signed("GET", "/api/v3/account", params={})
-        for b in acc.get("balances", []):
-            if b.get("asset") == asset:
-                try:
-                    return float(b.get("free", 0))
-                except:
-                    return 0.0
-        return 0.0
-
-    def symbol_filters_spot(self, symbol: str) -> dict:
-        info = self._public("GET", "/api/v3/exchangeInfo", params={"symbol": symbol}) or {}
-        arr = info.get("symbols", [])
-        if not arr: return {}
-        out = {}
-        for f in arr[0].get("filters", []):
-            t = f.get("filterType")
-            if t in ("MIN_NOTIONAL","NOTIONAL"):
-                if "minNotional" in f:
-                    out["min_notional"] = float(f["minNotional"])
-                if "notional" in f:
-                    out["min_notional"] = max(float(out.get("min_notional", 0) or 0), float(f["notional"]))
-            elif t == "LOT_SIZE":
-                out["min_qty"] = float(f.get("minQty", 0))
-                out["step_size"] = float(f.get("stepSize", 0))
-            elif t == "PRICE_FILTER":
-                out["tick_size"] = float(f.get("tickSize", 0))
-        out.setdefault("min_notional", 5.0)
-        return out
-
-    # ------------------------ Futures (USDT-M) REST ------------------------
-
-    def _public_futures(self, method: str, path: str, params=None):
-        url = f"{self.fapi_base}{path}"
-        return self._http(method, url, params=params or {})
-
-    def _signed_futures(self, method: str, path: str, params=None):
-        if not self.api_key or not self.api_secret:
-            raise RuntimeError("ضع BINANCE_API_KEY و BINANCE_API_SECRET في .env/CFG")
-        url = f"{self.fapi_base}{path}"
-        q = params.copy() if params else {}
-        q.setdefault("recvWindow", RECV_WINDOW)
-        q["timestamp"] = self._ts_fut()
-        query = self._sign(q)
-        headers = {"X-MBX-APIKEY": self.api_key}
-        if method == "GET":
-            return self._http("GET", url, params=query, headers=headers)
-        else:
-            return self._http(method, url, params=query, headers=headers)
-
-    def futures_balance_usdt(self) -> float:
-        arr = self._signed_futures("GET", "/fapi/v2/balance", params={}) or []
-        for it in arr:
-            if it.get("asset") == "USDT":
-                try:
-                    return float(it.get("availableBalance", 0))
-                except:
-                    return 0.0
-        return 0.0
-
-    def futures_symbol_filters(self, symbol: str) -> dict:
-        info = self._public_futures("GET", "/fapi/v1/exchangeInfo", params={"symbol": symbol}) or {}
-        arr = info.get("symbols", [])
-        if not arr: return {}
-        out = {}
-        for f in arr[0].get("filters", []):
-            t = f.get("filterType")
-            if t in ("MIN_NOTIONAL","NOTIONAL"):
-                if "minNotional" in f:
-                    out["min_notional"] = float(f["minNotional"])
-                if "notional" in f:
-                    out["min_notional"] = max(float(out.get("min_notional", 0) or 0), float(f["notional"]))
-            elif t in ("LOT_SIZE","MARKET_LOT_SIZE"):
-                out["min_qty"]  = float(f.get("minQty", 0))
-                out["step_size"] = float(f.get("stepSize", 0))
-            elif t == "PRICE_FILTER":
-                out["tick_size"] = float(f.get("tickSize", 0))
-        out.setdefault("min_notional", 5.0)
-        return out
-
-    def futures_set_leverage(self, symbol: str, leverage: int):
-        return self._signed_futures("POST", "/fapi/v1/leverage", params={"symbol": symbol, "leverage": leverage})
-
-    def futures_set_margin_type(self, symbol: str, margin_type: str = "ISOLATED"):
-        # قد يُرجع 400/409 لو مضبوط مسبقًا
         try:
-            return self._signed_futures("POST", "/fapi/v1/marginType", params={"symbol": symbol, "marginType": margin_type})
-        except requests.HTTPError as e:
-            if e.response is not None and e.response.status_code in (400, 409):
-                return {"info": "marginType already set"}
+            return self._post("/api/v3/order", signed=True, data=params)
+        except RuntimeError as e:
             raise
 
-    def futures_get_position_mode(self) -> str:
-        r = self._signed_futures("GET", "/fapi/v1/positionSide/dual", params={}) or {}
-        return "HEDGE" if r.get("dualSidePosition") else "ONEWAY"
+    # ------------- open orders / cancel (اختياري) -------------
+    def open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+        p = {}
+        if symbol:
+            p["symbol"] = symbol.upper()
+        return self._get("/api/v3/openOrders", signed=True, params=p)
 
-    def futures_get_symbol_leverage(self, symbol: str):
-        arr = self._signed_futures("GET", "/fapi/v2/positionRisk", params={"symbol": symbol}) or []
-        if isinstance(arr, list) and arr:
-            lev = arr[0].get("leverage")
-            try:
-                return int(float(lev))
-            except:
-                return None
-        return None
-
-    def futures_order_market(self, symbol: str, side: str, quantity: float):
-        params = {
-            "symbol": symbol,
-            "side": side,
-            "type": "MARKET",
-            "quantity": f"{float(quantity):.8f}",
-        }
-        return self._signed_futures("POST", "/fapi/v1/order", params=params)
+    def cancel_all(self, symbol: str) -> List[Dict[str, Any]]:
+        return self._delete("/api/v3/openOrders", signed=True, params={"symbol": symbol.upper()})

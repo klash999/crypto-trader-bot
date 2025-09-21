@@ -3,50 +3,81 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-def _b(v, default=False):
-    if v is None: return default
-    return str(v).strip() in ("1","true","True","yes","YES","on","ON")
+def _str(key: str, default: str = "") -> str:
+    v = os.getenv(key, default)
+    return "" if v is None else str(v).strip()
 
-def _f(v, d=0.0):
-    try: return float(v)
-    except: return d
+def _int(key: str, default: int = 0) -> int:
+    try:
+        return int(os.getenv(key, str(default)))
+    except Exception:
+        return default
 
-def _i(v, d=0):
-    try: return int(v)
-    except: return d
+def _float(key: str, default: float = 0.0) -> float:
+    try:
+        return float(os.getenv(key, str(default)))
+    except Exception:
+        return default
+
+def _bool(key: str, default: bool = False) -> bool:
+    v = os.getenv(key, None)
+    if v is None:
+        return default
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+def bool_env(key: str, default: bool) -> bool:
+    return _bool(key, default)
 
 CFG = {
-    "TELEGRAM_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
-    "TELEGRAM_ADMIN": _i(os.getenv("TELEGRAM_ADMIN_ID", "")),
-    "TELEGRAM_ADMIN_USERNAME": os.getenv("TELEGRAM_ADMIN_USERNAME", "").strip(),
-    "TZ": os.getenv("TZ", "Asia/Riyadh"),
-    "OFFLINE": _b(os.getenv("OFFLINE_MODE", "0")),
+    # Telegram
+    "TELEGRAM_TOKEN": _str("TELEGRAM_BOT_TOKEN", ""),
+    "TELEGRAM_ADMIN": _int("TELEGRAM_ADMIN_ID", 0),
+    "TELEGRAM_ADMIN_USERNAME": _str("TELEGRAM_ADMIN_USERNAME", ""),
+
+    # Binance
     "BINANCE": {
-        "key": os.getenv("BINANCE_API_KEY", "").strip(),
-        "secret": os.getenv("BINANCE_API_SECRET", "").strip(),
-        "testnet": _b(os.getenv("BINANCE_TESTNET", "0")),
+        "api_key": _str("BINANCE_API_KEY", ""),
+        "api_secret": _str("BINANCE_API_SECRET", ""),
+        "testnet": _bool("BINANCE_TESTNET", False),
     },
-    "CRYPTO_SYMBOL": os.getenv("CRYPTO_SYMBOL", "BTCUSDT").strip(),
-    "ALLOCATION": {
-        "mode": os.getenv("ALLOCATION_MODE", "all").strip(),     # all/fixed/percent
-        "fixed_quote": _f(os.getenv("ORDER_QUOTE_QTY", "50")),
-        "percent": _f(os.getenv("ORDER_PCT", "0.25")),
-        "reserve": _f(os.getenv("RESERVE_USDT", "0")),
-        "hard_cap": _f(os.getenv("HARD_CAP_USDT", "0")),
-    },
+
+    # عام
+    "TZ": _str("TZ", "Asia/Riyadh"),
+    "OFFLINE_MODE": _bool("OFFLINE_MODE", False),
+
+    # إعدادات التداول الأساسية
+    "CRYPTO_SYMBOL": _str("CRYPTO_SYMBOL", "BTCUSDT"),
+    # ملاحظة: البوت سيستخدم كل الرصيد المتاح تلقائياً، لكن نترك قيمة افتراضية احتياطية
+    "ORDER_QUOTE_QTY": _float("ORDER_QUOTE_QTY", 50.0),
+
     "TRADING": {
-        "tp_pct": _f(os.getenv("TP_PCT", "0.10")),
-        "sl_pct": _f(os.getenv("SL_PCT", "0.01")),
-        "trail_pct": _f(os.getenv("TRAIL_PCT", "0.02")),
-        "lock_eps": _f(os.getenv("LOCK_EPS", "0.002")),
-        "cooldown_s": _i(os.getenv("COOLDOWN_S", "60")),
-        "auto_shutdown_days": _i(os.getenv("AUTO_SHUTDOWN_DAYS", "7")),
-        "fast_window_s": _i(os.getenv("FAST_WINDOW_S", "600")),
-        "pump_lookback_min": _i(os.getenv("PUMP_LOOKBACK_MIN", "5")),
-        "pump_pct": _f(os.getenv("PUMP_PCT", "0.10")),
+        "tp_pct": _float("TP_PCT", 0.10),            # هدف 10% كحد أقصى
+        "sl_pct": _float("SL_PCT", 0.01),
+        "trail_pct": _float("TRAIL_PCT", 0.03),      # وقف متحرك (لـ Fast-Runner)
+        "cooldown_s": _int("COOLDOWN_S", 60),
+        "auto_shutdown_days": _int("AUTO_SHUTDOWN_DAYS", 7),
+
+        # Fast Runner / Pump logic
+        "fast_window_s": _int("FAST_WINDOW_S", 900),           # 15 دقيقة
+        "pump_lookback_min": _int("PUMP_LOOKBACK_MIN", 5),
+        "pump_pct": _float("PUMP_PCT", 0.05),                  # +5%/X دقائق
+        "lock_eps": _float("LOCK_EPS", 0.002),                 # قفل الربح أقل قليلاً من الهدف
     },
+
+    # AutoScan
     "AUTOSCAN": {
-        "enabled": _b(os.getenv("AUTOSCAN_ENABLED", "1")),
-        "interval_min": _i(os.getenv("AUTOSCAN_INTERVAL_MIN", "60")),
-    }
+        "enabled": _bool("ENABLE_AUTOSCAN", True),
+        "interval_min": _int("AUTOSCAN_INTERVAL_MIN", 60),
+        "min_quote_vol_usd": _float("AUTOSCAN_MIN_QVOL", 3_000_000.0),
+        # رموز تُستبعد من السكانر
+        "exclude_tokens": [t.strip() for t in _str("AUTOSCAN_EXCLUDES", "UP,DOWN,BULL,BEAR,TRY,EUR,BRL,FDUSD,BUSD").split(",") if t.strip()],
+        "max_symbols": _int("AUTOSCAN_MAX_SYMBOLS", 200),
+    },
+
+    # ميزات اختيارية تُغيّر سلوك /start وقائمة الأوامر
+    "FEATURES": {
+        "autoscan": _bool("ENABLE_AUTOSCAN", True),
+        "news": _bool("ENABLE_NEWS", False),
+        "futures": _bool("ENABLE_FUTURES", False),
+    },
 }

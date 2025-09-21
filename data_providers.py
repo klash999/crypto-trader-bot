@@ -1,59 +1,34 @@
-# data_providers.py
-from __future__ import annotations
-
-from zoneinfo import ZoneInfo
 import pandas as pd
-
+from zoneinfo import ZoneInfo
 from config import CFG
 from trade_binance import BinanceREST
 
-TZ = ZoneInfo(CFG.get("TZ", "Asia/Riyadh"))
-
+TZ = ZoneInfo(CFG["TZ"])
 
 class PriceProvider:
-    """
-    موحِّد جلب الأسعار للشموع الدقيقة من Binance Spot.
-    يعيد DataFrame مفهرس زمنيًا (TZ-aware).
-    """
+    """جلب شموع 1m من Binance وتحويلها إلى DataFrame بزمن محلي."""
     def __init__(self):
-        self.br = BinanceREST()
-        self.last_symbol: str | None = None
+        self.last_symbol = None
+        self.br = BinanceREST(
+            api_key=CFG["BINANCE"]["key"],
+            api_secret=CFG["BINANCE"]["secret"],
+            testnet=CFG["BINANCE"]["testnet"],
+        )
 
     def get_recent_1m(self, symbol: str, limit: int = 900) -> pd.DataFrame:
-        """
-        يجلب آخر (limit) شمعة 1m من Binance.
-        يعالج الفهرس الزمني لضمان DatetimeIndex TZ-aware.
-        """
-        df = self.br.klines(symbol, interval="1m", limit=limit)
         self.last_symbol = symbol
-
-        if df is None or df.empty:
+        kl = self.br.klines(symbol=symbol, interval="1m", limit=limit)
+        if not isinstance(kl, list) or not kl:
             return pd.DataFrame()
-
-        # ✅ تأكيد أن الفهرس DatetimeIndex TZ-aware
-        if not isinstance(df.index, pd.DatetimeIndex):
-            # محاولة بناء الفهرس من OpenTime
-            if "OpenTime" in df.columns:
-                ts = pd.to_numeric(df["OpenTime"], errors="coerce").astype("Int64")
-                ts = ts.fillna(method="ffill").fillna(method="bfill").astype("int64")
-                idx_utc = pd.to_datetime(ts, unit="ms", utc=True)
-                df.index = pd.DatetimeIndex(idx_utc).tz_convert(TZ)
-            # محاولة بديلة من CloseTime
-            elif "CloseTime" in df.columns:
-                ts = pd.to_numeric(df["CloseTime"], errors="coerce").astype("Int64")
-                ts = ts.fillna(method="ffill").fillna(method="bfill").astype("int64")
-                idx_utc = pd.to_datetime(ts, unit="ms", utc=True)
-                df.index = pd.DatetimeIndex(idx_utc).tz_convert(TZ)
-            else:
-                # كحل أخير: تحوّل index الحالي إلى DatetimeIndex إن أمكن
-                try:
-                    df.index = pd.to_datetime(df.index, utc=True)
-                    df.index = pd.DatetimeIndex(df.index).tz_convert(TZ)
-                except Exception:
-                    pass  # سيؤدي لاحقًا إلى فشل عرض الشارت إن لم يكن صالحًا
-
-        # تنظيف وترتيب
-        df = df.sort_index()
-        df = df.dropna(subset=["Open", "High", "Low", "Close"])
-
-        return df
+        cols = ["OpenTime","Open","High","Low","Close","Volume","CloseTime","QAV","Trades","TBBase","TBQuote","Ignore"]
+        df = pd.DataFrame(kl, columns=cols)
+        # تحويل الأنواع
+        for c in ("Open","High","Low","Close","Volume"):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        # فهرس زمني
+        dt_utc = pd.to_datetime(df["OpenTime"], unit="ms", utc=True)
+        df.index = dt_utc.tz_convert(TZ)
+        # أعمدة قياسية
+        out = df[["Open","High","Low","Close","Volume"]].copy()
+        out = out.dropna()
+        return out
